@@ -1,13 +1,15 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { NextResponse } from "next/server";
 import { isProject, type Project } from "@/lib/projects";
+import { getSupabase } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 
-const projectsFile = path.join(process.cwd(), "data", "projects.json");
-let mutationQueue: Promise<void> = Promise.resolve();
+type ProjectRow = {
+  id: string;
+  status: Project["status"];
+  created_at: string;
+  payload: unknown;
+};
 
 class ApiError extends Error {
   constructor(
@@ -18,49 +20,17 @@ class ApiError extends Error {
   }
 }
 
-async function readProjects(): Promise<Project[]> {
-  try {
-    const contents = await readFile(projectsFile, "utf8");
-    const parsed: unknown = JSON.parse(contents);
-    if (!Array.isArray(parsed) || !parsed.every(isProject)) {
-      throw new Error("Saved project data is invalid.");
-    }
-    return parsed;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-}
-
-async function writeProjects(projects: Project[]) {
-  const folder = path.dirname(projectsFile);
-  const temporaryFile = `${projectsFile}.${randomUUID()}.tmp`;
-  await mkdir(folder, { recursive: true });
-  await writeFile(temporaryFile, JSON.stringify(projects, null, 2), "utf8");
-  await rename(temporaryFile, projectsFile);
-}
-
-async function mutateProjects<T>(
-  update: (current: Project[]) => { projects: Project[]; result: T },
-): Promise<T> {
-  const operation = mutationQueue.then(async () => {
-    const current = await readProjects();
-    const { projects, result } = update(current);
-    await writeProjects(projects);
-    return result;
-  });
-  mutationQueue = operation.then(
-    () => undefined,
-    () => undefined,
-  );
-  return operation;
-}
-
 function errorResponse(error: unknown) {
-  const message = error instanceof Error ? error.message : "Project operation failed.";
-  const status = error instanceof ApiError ? error.status : 500;
-  if (status === 500) console.error("Project API request failed.", error);
-  return NextResponse.json({ error: message }, { status });
+  if (error instanceof ApiError) {
+    return NextResponse.json({ error: error.message }, { status: error.status });
+  }
+
+  console.error("Project API request failed.", error);
+  const message =
+    error instanceof Error && error.message.includes("Supabase is not configured")
+      ? error.message
+      : "Project database request failed. Check the Supabase connection and table setup.";
+  return NextResponse.json({ error: message }, { status: 500 });
 }
 
 function validateProject(value: unknown): Project {
@@ -70,9 +40,32 @@ function validateProject(value: unknown): Project {
   return value;
 }
 
+function projectFromRow(row: ProjectRow): Project {
+  const project = row.payload;
+  if (!isProject(project) || project.id !== row.id) {
+    throw new Error(`Project record "${row.id}" is malformed in Supabase.`);
+  }
+  return project;
+}
+
+const toRow = (project: Project) => ({
+  id: project.id,
+  status: project.status,
+  created_at: project.createdAt,
+  payload: project,
+});
+
 export async function GET() {
   try {
-    return NextResponse.json({ projects: await readProjects() });
+    const { data, error } = await getSupabase()
+      .from("projects")
+      .select("id,status,created_at,payload")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+    return NextResponse.json({
+      projects: (data as ProjectRow[]).map(projectFromRow),
+    });
   } catch (error) {
     return errorResponse(error);
   }
@@ -81,13 +74,17 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const project = validateProject(await request.json());
-    const created = await mutateProjects((current) => {
-      if (current.some((item) => item.id === project.id)) {
-        throw new ApiError("A project with this ID already exists.", 409);
-      }
-      return { projects: [project, ...current], result: project };
-    });
-    return NextResponse.json({ project: created }, { status: 201 });
+    const { data, error } = await getSupabase()
+      .from("projects")
+      .insert(toRow(project))
+      .select("id,status,created_at,payload")
+      .single();
+
+    if (error) {
+      if (error.code === "23505") throw new ApiError("A project with this ID already exists.", 409);
+      throw error;
+    }
+    return NextResponse.json({ project: projectFromRow(data as ProjectRow) }, { status: 201 });
   } catch (error) {
     return errorResponse(error);
   }
@@ -96,16 +93,16 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   try {
     const project = validateProject(await request.json());
-    const updated = await mutateProjects((current) => {
-      if (!current.some((item) => item.id === project.id)) {
-        throw new ApiError("Project not found.", 404);
-      }
-      return {
-        projects: current.map((item) => (item.id === project.id ? project : item)),
-        result: project,
-      };
-    });
-    return NextResponse.json({ project: updated });
+    const { data, error } = await getSupabase()
+      .from("projects")
+      .update(toRow(project))
+      .eq("id", project.id)
+      .select("id,status,created_at,payload")
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) throw new ApiError("Project not found.", 404);
+    return NextResponse.json({ project: projectFromRow(data as ProjectRow) });
   } catch (error) {
     return errorResponse(error);
   }
@@ -117,13 +114,16 @@ export async function DELETE(request: Request) {
     if (!body || typeof body !== "object" || !("id" in body) || typeof body.id !== "string") {
       throw new ApiError("A project ID is required.", 400);
     }
-    const id = body.id;
-    await mutateProjects((current) => {
-      if (!current.some((item) => item.id === id)) {
-        throw new ApiError("Project not found.", 404);
-      }
-      return { projects: current.filter((item) => item.id !== id), result: undefined };
-    });
+
+    const { data, error } = await getSupabase()
+      .from("projects")
+      .delete()
+      .eq("id", body.id)
+      .select("id")
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) throw new ApiError("Project not found.", 404);
     return NextResponse.json({ success: true });
   } catch (error) {
     return errorResponse(error);
